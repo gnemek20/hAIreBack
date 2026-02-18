@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for haireback on 2026-02-17T22:00:42+09:00
+# fly.toml app configuration file generated for haire-back on 2026-02-18T03:15:44+09:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'haireback'
+app = 'haire-back'
 primary_region = 'nrt'
 
 [build]

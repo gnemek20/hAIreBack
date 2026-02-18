@@ -1,3 +1,10 @@
 fastapi
 uvicorn[standard]
 gunicorn
+
+asyncpg
+argon2-cffi
+passlib[bcrypt,argon2]
+
+python-jose
+requests
