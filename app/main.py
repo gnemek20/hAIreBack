@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 import os
 import requests
@@ -11,6 +12,7 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta
 
 app = FastAPI()
+security = HTTPBearer()
 
 app.add_middleware(
   CORSMiddleware,
@@ -47,6 +49,17 @@ def create_access_token(
   to_encode.update({"exp": expire})
   encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
   return encoded_jwt
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+  token = credentials.credentials
+  try:
+    payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+    user_id = payload.get("sub")
+    if user_id is None:
+      raise HTTPException(status_code=401, detail="Invalid token")
+    return user_id
+  except JWTError:
+    raise HTTPException(status_code=401, detail="Invalid token")
 
 @app.on_event("startup")
 async def startup():
@@ -131,6 +144,148 @@ async def sign_in(request: Request):
   )
 
   return {"status": "success", "username": username, "access_token": access_token, "token_type": "bearer"}
+
+@app.post("/users/subscriptions/list")
+async def list_subscriptions(request: Request):
+  if not hasattr(app.state, "db") or app.state.db is None:
+    raise HTTPException(status_code=500, detail="Cannot connect with DB")
+
+  body = await request.json()
+  token = body.get("access_token")
+
+  if not token:
+    raise HTTPException(status_code=401, detail="Token required")
+
+  try:
+    payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+    user_id = payload.get("sub")
+    if user_id is None:
+      raise HTTPException(status_code=401, detail="Invalid token")
+  except JWTError:
+    raise HTTPException(status_code=401, detail="Invalid token")
+
+  async with app.state.db.acquire() as conn:
+    rows = await conn.fetch(
+      """
+      SELECT slug
+      FROM user_subscription
+      WHERE user_id = $1
+      """,
+      user_id
+    )
+
+  subscriptions = [row["slug"] for row in rows]
+
+  return {
+    "status": "success",
+    "subscriptions": subscriptions
+  }
+
+@app.post("/users/subscriptions")
+async def update_subscriptions(request: Request):
+  if not hasattr(app.state, "db") or app.state.db is None:
+    raise HTTPException(status_code=500, detail="Cannot connect with DB")
+
+  body = await request.json()
+
+  token = body.get("access_token")
+  subscriptions = body.get("subscriptions")
+
+  if not token:
+    raise HTTPException(status_code=401, detail="Token required")
+
+  if not subscriptions or not isinstance(subscriptions, list):
+    raise HTTPException(status_code=400, detail="subscriptions must be a list")
+
+  try:
+    payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+    user_id = payload.get("sub")
+
+    if user_id is None:
+      raise HTTPException(status_code=401, detail="Invalid token")
+
+  except JWTError:
+    raise HTTPException(status_code=401, detail="Invalid token")
+
+  async with app.state.db.acquire() as conn:
+    # 유저 존재 확인
+    user = await conn.fetchrow(
+      'SELECT id FROM "user" WHERE id = $1',
+      user_id
+    )
+
+    if not user:
+      raise HTTPException(status_code=404, detail="User not found")
+
+    async with conn.transaction():
+      inserted_count = 0
+
+      for slug in subscriptions:
+        row = await conn.fetchrow(
+          """
+          INSERT INTO user_subscription (user_id, slug)
+          VALUES ($1, $2)
+          ON CONFLICT (user_id, slug) DO NOTHING
+          RETURNING id
+          """,
+          user_id,
+          slug
+        )
+
+        if row:
+          inserted_count += 1
+
+  return {
+    "status": "success",
+    "inserted_rows": inserted_count
+  }
+
+@app.delete("/users/subscriptions")
+async def delete_subscription(request: Request):
+  if not hasattr(app.state, "db") or app.state.db is None:
+    raise HTTPException(status_code=500, detail="Cannot connect with DB")
+
+  body = await request.json()
+
+  token = body.get("access_token")
+  slug = body.get("slug")
+
+  if not token:
+    raise HTTPException(status_code=401, detail="Token required")
+
+  if not slug:
+    raise HTTPException(status_code=400, detail="slug required")
+
+  try:
+    payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+    user_id = payload.get("sub")
+
+    if user_id is None:
+      raise HTTPException(status_code=401, detail="Invalid token")
+
+  except JWTError:
+    raise HTTPException(status_code=401, detail="Invalid token")
+
+  async with app.state.db.acquire() as conn:
+    result = await conn.execute(
+      """
+      DELETE FROM user_subscription
+      WHERE user_id = $1
+      AND slug = $2
+      """,
+      user_id,
+      slug
+    )
+
+    deleted_count = int(result.split(" ")[1])
+
+    if deleted_count == 0:
+      raise HTTPException(status_code=404, detail="Subscription not found")
+
+  return {
+    "status": "success",
+    "deleted_rows": deleted_count
+  }
 
 # @app.post("/test")
 # async def test_repo(request: Request):
