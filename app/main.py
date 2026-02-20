@@ -26,7 +26,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 JWT_SECRET = os.getenv("JWT_SECRET_KEY")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 6 * 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 24 * 60
 
 OAUTH_ID = os.getenv("OAUTH_ID")
 OAUTH_SECRET = os.getenv("OAUTH_SECRET")
@@ -246,46 +246,277 @@ async def delete_subscription(request: Request):
     raise HTTPException(status_code=500, detail="Cannot connect with DB")
 
   body = await request.json()
-
   token = body.get("access_token")
   slug = body.get("slug")
 
   if not token:
     raise HTTPException(status_code=401, detail="Token required")
-
   if not slug:
     raise HTTPException(status_code=400, detail="slug required")
 
   try:
     payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
     user_id = payload.get("sub")
-
     if user_id is None:
       raise HTTPException(status_code=401, detail="Invalid token")
-
   except JWTError:
     raise HTTPException(status_code=401, detail="Invalid token")
 
   async with app.state.db.acquire() as conn:
-    result = await conn.execute(
+    async with conn.transaction():
+      result = await conn.execute(
+        """
+        DELETE FROM user_subscription
+        WHERE user_id = $1
+        AND slug = $2
+        """,
+        user_id,
+        slug
+      )
+      deleted_sub_count = int(result.split(" ")[1])
+      if deleted_sub_count == 0:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+      result = await conn.execute(
+        """
+        DELETE FROM chat_messages
+        WHERE user_id = $1
+        AND slug = $2
+        """,
+        user_id,
+        slug
+      )
+      deleted_chat_count = int(result.split(" ")[1])
+
+  return {
+    "status": "success",
+    "deleted_subscriptions": deleted_sub_count,
+    "deleted_chat_messages": deleted_chat_count
+  }
+
+# @app.post("/users/agents/list")
+# async def list_agents(request: Request):
+#   if not hasattr(app.state, "db") or app.state.db is None:
+#     raise HTTPException(status_code=500, detail="Cannot connect with DB")
+
+#   body = await request.json()
+#   token = body.get("access_token")
+
+#   if not token:
+#     raise HTTPException(status_code=401, detail="Token required")
+
+#   try:
+#     payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+#     user_id = payload.get("sub")
+#     if user_id is None:
+#       raise HTTPException(status_code=401, detail="Invalid token")
+#   except JWTError:
+#     raise HTTPException(status_code=401, detail="Invalid token")
+
+#   async with app.state.db.acquire() as conn:
+#     rows = await conn.fetch(
+#       """
+#       SELECT slug
+#       FROM user_agent
+#       WHERE user_id = $1
+#       """,
+#       user_id
+#     )
+
+#   agents = [row["slug"] for row in rows]
+
+#   return {
+#     "status": "success",
+#     "agents": agents
+#   }
+
+# @app.post("/users/agents")
+# async def add_agent(request: Request):
+#   if not hasattr(app.state, "db") or app.state.db is None:
+#     raise HTTPException(status_code=500, detail="Cannot connect with DB")
+
+#   body = await request.json()
+#   token = body.get("access_token")
+#   slug = body.get("slug")  # 단일 slug 전달
+
+#   if not token:
+#     raise HTTPException(status_code=401, detail="Token required")
+#   if not slug:
+#     raise HTTPException(status_code=400, detail="slug is required")
+
+#   try:
+#     payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+#     user_id = payload.get("sub")
+#     if user_id is None:
+#       raise HTTPException(status_code=401, detail="Invalid token")
+#   except JWTError:
+#     raise HTTPException(status_code=401, detail="Invalid token")
+
+#   async with app.state.db.acquire() as conn:
+#     # 유저 존재 확인
+#     user = await conn.fetchrow('SELECT id FROM "user" WHERE id = $1', user_id)
+#     if not user:
+#       raise HTTPException(status_code=404, detail="User not found")
+
+#     async with conn.transaction():
+#       row = await conn.fetchrow(
+#         """
+#         INSERT INTO user_agent (user_id, slug)
+#         VALUES ($1, $2)
+#         ON CONFLICT (user_id, slug) DO NOTHING
+#         RETURNING id
+#         """,
+#         user_id,
+#         slug
+#       )
+#       inserted_count = 1 if row else 0
+
+#   return {
+#     "status": "success",
+#     "inserted_agents": inserted_count
+#   }
+
+# @app.delete("/users/agents")
+# async def delete_agent(request: Request):
+#   if not hasattr(app.state, "db") or app.state.db is None:
+#     raise HTTPException(status_code=500, detail="Cannot connect with DB")
+
+#   body = await request.json()
+#   token = body.get("access_token")
+#   slug = body.get("slug")
+
+#   if not token:
+#     raise HTTPException(status_code=401, detail="Token required")
+#   if not slug:
+#     raise HTTPException(status_code=400, detail="slug required")
+
+#   try:
+#     payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+#     user_id = payload.get("sub")
+#     if user_id is None:
+#       raise HTTPException(status_code=401, detail="Invalid token")
+#   except JWTError:
+#     raise HTTPException(status_code=401, detail="Invalid token")
+
+#   async with app.state.db.acquire() as conn:
+#     async with conn.transaction():
+#       result = await conn.execute(
+#         """
+#         DELETE FROM user_agent
+#         WHERE user_id = $1
+#         AND slug = $2
+#         """,
+#         user_id,
+#         slug
+#       )
+#       deleted_count = int(result.split(" ")[1])
+#       if deleted_count == 0:
+#         raise HTTPException(status_code=404, detail="Agent not found")
+
+#   return {
+#     "status": "success",
+#     "deleted_agents": deleted_count
+#   }
+
+@app.post("/users/chat/history")
+async def get_chat_history(request: Request):
+  if not hasattr(app.state, "db") or app.state.db is None:
+    raise HTTPException(status_code=500, detail="Cannot connect with DB")
+
+  body = await request.json()
+  token = body.get("access_token")
+  slug = body.get("slug")
+
+  if not token:
+    raise HTTPException(status_code=401, detail="Access token is required")
+  if not slug:
+    raise HTTPException(status_code=400, detail="Slug is required")
+
+  try:
+    payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+    user_id = payload.get("sub")
+    if user_id is None:
+      raise HTTPException(status_code=401, detail="Invalid token")
+  except JWTError:
+    raise HTTPException(status_code=401, detail="Invalid token")
+
+  async with app.state.db.acquire() as conn:
+    rows = await conn.fetch(
       """
-      DELETE FROM user_subscription
-      WHERE user_id = $1
-      AND slug = $2
+      SELECT id, slug, sender, content, raw_content, status, EXTRACT(EPOCH FROM created_at) * 1000 AS timestamp
+      FROM chat_messages
+      WHERE user_id = $1 AND slug = $2
+      ORDER BY created_at ASC
       """,
       user_id,
       slug
     )
 
-    deleted_count = int(result.split(" ")[1])
-
-    if deleted_count == 0:
-      raise HTTPException(status_code=404, detail="Subscription not found")
+  chat_history = []
+  for row in rows:
+    chat_history.append({
+      "id": str(row["id"]),
+      "slug": row["slug"],
+      "sender": row["sender"],
+      "content": row["content"],
+      "raw_content": row["raw_content"],
+      "status": row["status"],
+      "timestamp": int(row["timestamp"])
+    })
 
   return {
     "status": "success",
-    "deleted_rows": deleted_count
+    "chat_history": chat_history
   }
+
+@app.post("/users/chat/save")
+async def save_chat_history(request: Request):
+  if not hasattr(app.state, "db") or app.state.db is None:
+    raise HTTPException(status_code=500, detail="Cannot connect with DB")
+
+  body = await request.json()
+  token = body.get("access_token")
+  slug = body.get("slug")
+  chat_history = body.get("chat_history")
+
+  if not token:
+    raise HTTPException(status_code=401, detail="Access token is required")
+  if not slug:
+    raise HTTPException(status_code=400, detail="Slug is required")
+  if not chat_history or not isinstance(chat_history, list):
+    raise HTTPException(status_code=400, detail="Chat History must be a list")
+
+  try:
+    payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+    user_id = payload.get("sub")
+    if user_id is None:
+      raise HTTPException(status_code=401, detail="Invalid token")
+  except JWTError:
+    raise HTTPException(status_code=401, detail="Invalid token")
+
+  async with app.state.db.acquire() as conn:
+    async with conn.transaction():
+      for msg in chat_history:
+        if not all(k in msg for k in ("id", "sender", "content", "timestamp")):
+          continue
+
+        await conn.execute(
+          """
+          INSERT INTO chat_messages (id, user_id, slug, sender, content, raw_content, status, created_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8 / 1000.0))
+          ON CONFLICT (id) DO NOTHING
+          """,
+          msg["id"],
+          user_id,
+          slug,
+          msg["sender"],
+          msg.get("content"),
+          msg.get("raw_content"),
+          msg.get("status"),
+          msg["timestamp"]
+        )
+
+  return { "status": "success", "saved": len(chat_history) }
 
 # @app.post("/test")
 # async def test_repo(request: Request):
