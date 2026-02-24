@@ -1,8 +1,10 @@
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
 
 import os
+import asyncio
 import asyncpg
 import json
 
@@ -14,13 +16,10 @@ from datetime import datetime, timedelta
 app = FastAPI()
 security = HTTPBearer()
 
-app.add_middleware(
-  CORSMiddleware,
-  allow_origins=["*"],
-  allow_methods=["*"],
-  allow_headers=["*"],
-  allow_credentials=True
-)
+# ── CORS: 개발 단계에서 모든 origin 허용 ──
+# allow_credentials=True 일 때 allow_origins=["*"] 는 CORS 스펙 위반이므로
+# credentials=False로 설정. Bearer 토큰은 allow_headers로 허용.
+CORS_ORIGINS = ["*"]
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("JWT_SECRET_KEY")
@@ -31,6 +30,31 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 24 * 60
 # =========================================================
 # Common Utilities
 # =========================================================
+
+_pool_lock = asyncio.Lock()
+
+async def _ensure_pool():
+  """Create the asyncpg pool if it doesn't exist yet (lazy init / reconnect)."""
+  if getattr(app.state, "db", None) is not None:
+    return app.state.db
+  async with _pool_lock:
+    # Double-check after acquiring lock
+    if getattr(app.state, "db", None) is not None:
+      return app.state.db
+    if not DATABASE_URL:
+      raise HTTPException(status_code=500, detail="DATABASE_URL is not configured")
+    try:
+      app.state.db = await asyncpg.create_pool(
+        DATABASE_URL, min_size=0, max_size=1,
+        max_inactive_connection_lifetime=30,  # 30초 후 유휴 연결 해제
+        command_timeout=15,
+      )
+      print("DB pool (re)created successfully")
+    except Exception as e:
+      print(f"DB pool creation failed: {e}")
+      raise HTTPException(status_code=500, detail="Cannot connect with DB")
+  return app.state.db
+
 
 def get_db():
   db = getattr(app.state, "db", None)
@@ -73,13 +97,6 @@ async def get_current_user(
   return decode_token(credentials.credentials)
 
 
-async def get_user_id_from_body(body: dict) -> str:
-  token = body.get("access_token")
-  if not token:
-    raise HTTPException(status_code=401, detail="Access token required")
-  return decode_token(token)
-
-
 # =========================================================
 # Lifecycle
 # =========================================================
@@ -87,11 +104,17 @@ async def get_user_id_from_body(body: dict) -> str:
 @app.on_event("startup")
 async def startup():
   try:
-    app.state.db = await asyncpg.create_pool(DATABASE_URL)
+    app.state.db = await asyncpg.create_pool(
+      DATABASE_URL, min_size=0, max_size=1,
+      max_inactive_connection_lifetime=30,  # 30초 후 유휴 연결 해제
+      command_timeout=15,
+    )
     print("Success connecting with DB")
   except Exception as e:
     print(f"DATABASE_URL is [ {DATABASE_URL} ]")
     print(f"Failed connecting with DB: [ {e} ]")
+    # Pool will be retried lazily via _ensure_pool() on first request
+    app.state.db = None
 
 
 @app.on_event("shutdown")
@@ -99,6 +122,37 @@ async def shutdown():
   if getattr(app.state, "db", None):
     await app.state.db.close()
     print("Close DB")
+
+
+@app.middleware("http")
+async def ensure_db_middleware(request: Request, call_next):
+  # Handle CORS preflight immediately
+  if request.method == "OPTIONS":
+    return await call_next(request)
+  # Skip DB pool check for endpoints that don't need DB
+  if request.url.path in ("/healthcheck", "/guest-token"):
+    return await call_next(request)
+  try:
+    await _ensure_pool()
+  except HTTPException as exc:
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+  try:
+    return await call_next(request)
+  except Exception as exc:
+    import traceback
+    traceback.print_exc()
+    return JSONResponse(status_code=500, content={"detail": str(exc) or "Internal server error"})
+
+
+# CORSMiddleware must be added AFTER @app.middleware so it becomes
+# the outermost layer and adds CORS headers to ALL responses.
+app.add_middleware(
+  CORSMiddleware,
+  allow_origins=CORS_ORIGINS,
+  allow_methods=["*"],
+  allow_headers=["*"],
+  allow_credentials=False
+)
 
 
 @app.get("/healthcheck")
@@ -109,6 +163,17 @@ async def healthcheck():
 # =========================================================
 # Auth
 # =========================================================
+
+@app.get("/guest-token")
+async def guest_token():
+  """비로그인 사용자가 Agent Server 공개 API(목록·검색 등)를 사용할 수 있도록
+  1시간짜리 게스트 JWT를 발급합니다."""
+  token = create_access_token(
+    data={"sub": "guest"},
+    expires_delta=timedelta(hours=1)
+  )
+  return {"access_token": token}
+
 
 @app.post("/signup")
 async def sign_up(request: Request):
@@ -178,10 +243,8 @@ async def sign_in(request: Request):
 # =========================================================
 
 @app.post("/users/subscriptions/list")
-async def list_subscriptions(request: Request):
+async def list_subscriptions(user_id: str = Depends(get_current_user)):
   db = get_db()
-  body = await request.json()
-  user_id = await get_user_id_from_body(body)
 
   async with db.acquire() as conn:
     rows = await conn.fetch(
@@ -200,10 +263,9 @@ async def list_subscriptions(request: Request):
 
 
 @app.post("/users/subscriptions")
-async def update_subscriptions(request: Request):
+async def update_subscriptions(request: Request, user_id: str = Depends(get_current_user)):
   db = get_db()
   body = await request.json()
-  user_id = await get_user_id_from_body(body)
 
   subscriptions = body.get("subscriptions")
   if not subscriptions or not isinstance(subscriptions, list):
@@ -238,10 +300,9 @@ async def update_subscriptions(request: Request):
 
 
 @app.delete("/users/subscriptions")
-async def delete_subscription(request: Request):
+async def delete_subscription(request: Request, user_id: str = Depends(get_current_user)):
   db = get_db()
   body = await request.json()
-  user_id = await get_user_id_from_body(body)
 
   slug = body.get("slug")
   if not slug:
@@ -284,87 +345,24 @@ async def delete_subscription(request: Request):
 # Agents
 # =========================================================
 
-@app.post("/users/agents/list")
-async def list_agents(request: Request):
+@app.post("/users/agents")
+async def list_agents(user_id: str = Depends(get_current_user)):
   db = get_db()
-  body = await request.json()
-  user_id = await get_user_id_from_body(body)
 
   async with db.acquire() as conn:
     rows = await conn.fetch(
       """
-      SELECT agent
-      FROM user_agent
+      SELECT slug, name, description, version, price, icon
+      FROM agents
       WHERE user_id = $1
+      ORDER BY created_at DESC
       """,
       user_id
     )
 
-  agents = [
-    json.loads(row["agent"]) if isinstance(row["agent"], str)
-    else row["agent"]
-    for row in rows
-  ]
+  agents = [dict(row) for row in rows]
 
   return {"status": "success", "agents": agents}
-
-
-@app.post("/users/agents")
-async def add_agent(request: Request):
-  db = get_db()
-  body = await request.json()
-  user_id = await get_user_id_from_body(body)
-
-  agent = body.get("agent")
-  if not agent:
-    raise HTTPException(status_code=400, detail="agent JSON is required")
-
-  async with db.acquire() as conn:
-    async with conn.transaction():
-      row = await conn.fetchrow(
-        """
-        INSERT INTO user_agent (user_id, agent)
-        VALUES ($1, $2::jsonb)
-        ON CONFLICT (user_id, agent) DO NOTHING
-        RETURNING id
-        """,
-        user_id,
-        json.dumps(agent)
-      )
-
-  return {
-    "status": "success",
-    "inserted": bool(row),
-    "agent_id": row["id"] if row else None
-  }
-
-
-@app.delete("/users/agents")
-async def delete_agent(request: Request):
-  db = get_db()
-  body = await request.json()
-  user_id = await get_user_id_from_body(body)
-
-  agent = body.get("agent")
-  if agent is None:
-    raise HTTPException(status_code=400, detail="agent JSON is required")
-
-  async with db.acquire() as conn:
-    async with conn.transaction():
-      result = await conn.execute(
-        """
-        DELETE FROM user_agent
-        WHERE user_id = $1 AND agent = $2::jsonb
-        """,
-        user_id,
-        json.dumps(agent)
-      )
-
-      deleted_count = int(result.split(" ")[1])
-      if deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Agent not found")
-
-  return {"status": "success", "deleted": True, "deleted_count": deleted_count}
 
 
 # =========================================================
@@ -372,10 +370,9 @@ async def delete_agent(request: Request):
 # =========================================================
 
 @app.post("/users/chat/history")
-async def get_chat_history(request: Request):
+async def get_chat_history(request: Request, user_id: str = Depends(get_current_user)):
   db = get_db()
   body = await request.json()
-  user_id = await get_user_id_from_body(body)
 
   slug = body.get("slug")
   if not slug:
@@ -394,13 +391,22 @@ async def get_chat_history(request: Request):
       slug
     )
 
+  def _parse_json_field(val):
+    """json 타입 컬럼은 asyncpg가 raw string 반환 → 역직렬화 필요."""
+    if val is None:
+      return None
+    try:
+      return json.loads(val)
+    except (json.JSONDecodeError, TypeError):
+      return val
+
   chat_history = [
     {
       "id": str(row["id"]),
       "slug": row["slug"],
       "sender": row["sender"],
-      "content": row["content"],
-      "raw_content": row["raw_content"],
+      "content": _parse_json_field(row["content"]),
+      "raw_content": _parse_json_field(row["raw_content"]),
       "status": row["status"],
       "timestamp": int(row["timestamp"])
     }
@@ -411,10 +417,9 @@ async def get_chat_history(request: Request):
 
 
 @app.post("/users/chat/save")
-async def save_chat_history(request: Request):
+async def save_chat_history(request: Request, user_id: str = Depends(get_current_user)):
   db = get_db()
   body = await request.json()
-  user_id = await get_user_id_from_body(body)
 
   slug = body.get("slug")
   chat_history = body.get("chat_history")
@@ -430,19 +435,22 @@ async def save_chat_history(request: Request):
         if not all(k in msg for k in ("id", "sender", "content", "timestamp")):
           continue
 
+        content = msg.get("content")
+        raw_content = msg.get("raw_content")
+
         await conn.execute(
           """
           INSERT INTO chat_messages
           (id, user_id, slug, sender, content, raw_content, status, created_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8 / 1000.0))
+          VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, to_timestamp($8 / 1000.0))
           ON CONFLICT (id) DO NOTHING
           """,
           msg["id"],
           user_id,
           slug,
           msg["sender"],
-          msg.get("content"),
-          msg.get("raw_content"),
+          json.dumps(content) if content is not None else None,
+          json.dumps(raw_content) if raw_content is not None else None,
           msg.get("status"),
           msg["timestamp"]
         )
